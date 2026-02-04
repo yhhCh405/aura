@@ -61,6 +61,49 @@ def get_project(session, api_base, project_path):
     return http_json(session, "GET", f"{api_base}/projects/{encoded}")
 
 
+def get_repo_file(session, api_base, project_id, file_path, ref="main"):
+    encoded_path = quote(file_path, safe="")
+    try:
+        data = http_json(session, "GET", f"{api_base}/projects/{project_id}/repository/files/{encoded_path}", params={"ref": ref})
+        if data and data.get("content"):
+            import base64
+            return base64.b64decode(data["content"]).decode("utf-8")
+    except Exception:
+        pass
+    return None
+
+
+def fetch_dynamic_rules(session, api_base, project_id, ref, rules_url=None, local_rules_path=None, verbose=False):
+    # Order: 1. Project Repo, 2. Remote URL, 3. Local Fallback
+    
+    # 1. Project Repo
+    log("Checking for project-specific rules (aura_rules.md)...", verbose)
+    rules = get_repo_file(session, api_base, project_id, "aura_rules.md", ref=ref)
+    if rules:
+        log("Found project-specific rules in repository.", verbose)
+        return rules, "project_repo:aura_rules.md"
+    
+    # 2. Remote URL
+    if rules_url:
+        log(f"Fetching rules from remote URL: {rules_url}", verbose)
+        try:
+            resp = session.get(rules_url, timeout=30)
+            if resp.status_code == 200:
+                log("Successfully fetched rules from remote URL.", verbose)
+                return resp.text, f"url:{rules_url}"
+        except Exception as e:
+            log(f"Failed to fetch rules from URL: {e}", verbose)
+            
+    # 3. Local Fallback
+    if local_rules_path:
+        log(f"Falling back to local rules: {local_rules_path}", verbose)
+        rules = read_text_file(local_rules_path)
+        if rules:
+            return rules, f"local:{local_rules_path}"
+            
+    return "", "none"
+
+
 def get_merge_request(session, api_base, project_id, mr_iid):
     return http_json(session, "GET", f"{api_base}/projects/{project_id}/merge_requests/{mr_iid}")
 
@@ -153,12 +196,12 @@ def bot_comment_id(path: str, line_type: str | None, line: int | None, body: str
     return hashlib.sha1(key).hexdigest()
 
 
-def wrap_bot_body(path: str, line_type: str | None, line: int | None, body: str) -> tuple[str, str, str]:
+def wrap_bot_body(path: str, line_type: str | None, line: int | None, body: str, footer: str = "*Gracefully reviewed by Aura*") -> tuple[str, str, str]:
     aid = bot_anchor_id(path, line_type, line)
     cid = bot_comment_id(path, line_type, line, body)
     # Use Markdown link style which is less likely to be stripped than HTML comments
     header = f"[//]: # (aura-review-bot anchor={aid} id={cid})"
-    return aid, cid, f"{header}\n{body}\n\n---\n*Gracefully reviewed by Aura*"
+    return aid, cid, f"{header}\n{body}\n\n---\n{footer}"
 
 
 def existing_bot_id_to_discussion_id(discussions) -> dict[str, str]:
@@ -470,13 +513,16 @@ def normalize_comments(raw_comments, file_path, valid_new, valid_old, new_type, 
     return out
 
 
-def post_comment(session, api_base, project_id, mr_iid, comment, paths, diff_refs, dry_run=False):
+def post_comment(session, api_base, project_id, mr_iid, comment, paths, diff_refs, dry_run=False, footer=None):
     base_sha, start_sha, head_sha = diff_refs
     new_path, old_path = paths
 
     # Always wrap with a bot marker (anchor+id) to prevent duplicates and enable updates across runs.
     path = comment.get("path") or new_path or old_path or ""
-    _, _, wrapped = wrap_bot_body(path, comment.get("line_type"), comment.get("line"), comment["body"])
+    wrap_kwargs = {}
+    if footer:
+        wrap_kwargs["footer"] = footer
+    _, _, wrapped = wrap_bot_body(path, comment.get("line_type"), comment.get("line"), comment["body"], **wrap_kwargs)
     body = wrapped
 
     payload = {"body": body}
@@ -553,8 +599,18 @@ def main():
     parser.add_argument("--ollama-host", default=os.getenv("OLLAMA_HOST", "http://localhost:11434"), help="Ollama host")
     parser.add_argument(
         "--rules-file",
-        default=os.getenv("MR_RULES_FILE", os.path.join(os.path.dirname(__file__), "rules", "mr_rules_v1.md")),
-        help="Path to MR rules markdown to include in the prompt",
+        default=os.getenv("MR_RULES_FILE"),
+        help="Path to local MR rules markdown (optional)",
+    )
+    parser.add_argument(
+        "--rules-url",
+        default=os.getenv("MR_RULES_URL"),
+        help="Remote URL to fetch MR rules from",
+    )
+    parser.add_argument(
+        "--footer",
+        default=os.getenv("BOT_FOOTER", "*Gracefully reviewed by Aura*"),
+        help="Custom footer for bot comments",
     )
     parser.add_argument(
         "--repo-type",
@@ -629,12 +685,23 @@ def main():
 
     total_posted = 0
 
-    rules_text = read_text_file(args.rules_file).strip()
+    # Fetch rules dynamically
+    rules_text, rules_source = fetch_dynamic_rules(
+        session, 
+        api_base, 
+        project_id, 
+        mr.get("source_branch", "main"),
+        rules_url=args.rules_url,
+        local_rules_path=args.rules_file,
+        verbose=args.verbose
+    )
+    rules_text = rules_text.strip()
+
     repo_type = args.repo_type
     if repo_type == "auto":
         repo_type = guess_repo_type(project_path)
 
-    log(f"[4/5] Loaded rules file: {args.rules_file} ({len(rules_text)} chars). Repo type={repo_type}.", args.verbose)
+    log(f"[4/5] Rules loaded from {rules_source} ({len(rules_text)} chars). Repo type={repo_type}.", args.verbose)
     log(f"[4/5] Using Ollama: host={args.ollama_host} model={args.model}", args.verbose)
 
     system_msg = (
@@ -672,7 +739,7 @@ def main():
             "Please update the MR description using the template."
         )
         # Wrap with anchor/id too so it can be updated on rerun.
-        _, header_cid, header_warning_wrapped = wrap_bot_body(header_path, header_line_type, header_line, header_body)
+        _, header_cid, header_warning_wrapped = wrap_bot_body(header_path, header_line_type, header_line, header_body, footer=args.footer)
         existing = bot_meta_by_anchor.get(header_anchor)
         try:
             if existing and args.update_existing and existing.get("note_id") is not None:
@@ -701,6 +768,7 @@ def main():
                     (changes[0].get("new_path") or "", changes[0].get("old_path") or ""),
                     diff_refs,
                     dry_run=args.dry_run,
+                    footer=args.footer,
                 )
                 total_posted += 1
                 bot_ids.add(header_cid)
@@ -801,9 +869,14 @@ def main():
                     # Remove footer/header and normalize for comparison
                     def clean_body(b):
                          b = re.sub(BOT_META_RE, "", b)
+                         # Search for the "---" separator often used before footers
+                         if "\n---\n" in b:
+                             b = b.split("\n---\n")[0]
                          b = b.replace("*Generated by AI*", "").replace("*Commented by bot*", "").strip()
                          b = b.replace("Generated by AI", "").replace("Commented by bot", "").strip()
                          b = b.replace("*Gracefully reviewed by Aura*", "").replace("Gracefully reviewed by Aura", "").strip()
+                         if args.footer:
+                             b = b.replace(args.footer, "").replace(args.footer.strip("*"), "").strip()
                          # Extremely aggressive normalization: remove all non-alphanumeric and lowercase
                          return re.sub(r'[^a-zA-Z0-9]', '', b).lower()
                     
@@ -827,7 +900,7 @@ def main():
 
                     # Calculate the CORRECT wrapped body for this code comment. 
                     # Use a unique variable name to avoid collision with header_warning_wrapped.
-                    _, _, comment_wrapped = wrap_bot_body(p, lt, ln, c.get("body", ""))
+                    _, _, comment_wrapped = wrap_bot_body(p, lt, ln, c.get("body", ""), footer=args.footer)
 
                     # If different, REPLY to the thread
                     log(f"Posting reply to existing discussion at {p} {lt}:{ln}", args.verbose)
@@ -857,6 +930,7 @@ def main():
                     (new_path, old_path),
                     diff_refs,
                     dry_run=args.dry_run,
+                    footer=args.footer,
                 )
                 bot_ids.add(cid)
                 total_posted += 1
